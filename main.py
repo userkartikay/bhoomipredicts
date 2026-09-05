@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import sqlite3
+from functools import lru_cache
 from pathlib import Path
 
 import joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 from seed_data import DB_PATH, build_seed_data
 
 ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "risk_model.pkl"
+DELAY_MODEL_PATH = ROOT / "delay_days_model.pkl"
 app = FastAPI(title="BhooMiPredict Land Case API", version="1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -21,8 +24,16 @@ DATASETS = {
     "court records": "rccms_cases",
     "payment records": "pfms_compensation",
     "rehabilitation records": "rr_records",
+    "batch snapshots": "case_snapshots",
     "joined case view": "joined",
 }
+
+
+class WhatIfOverrides(BaseModel):
+    legal_dispute_flag: bool | None = None
+    days_in_current_stage: int | None = Field(default=None, ge=1, le=3650)
+    compensation_paid_ratio: float | None = Field(default=None, ge=0, le=1)
+    rehabilitation_progress: float | None = Field(default=None, ge=0, le=1)
 
 
 def connection() -> sqlite3.Connection:
@@ -33,6 +44,7 @@ def connection() -> sqlite3.Connection:
     return db
 
 
+@lru_cache(maxsize=1)
 def model_bundle() -> dict:
     if not MODEL_PATH.exists():
         from train_model import train
@@ -40,11 +52,31 @@ def model_bundle() -> dict:
     return joblib.load(MODEL_PATH)
 
 
+@lru_cache(maxsize=1)
+def delay_model_bundle() -> dict:
+    if not DELAY_MODEL_PATH.exists():
+        from train_model import train
+        train()
+    return joblib.load(DELAY_MODEL_PATH)
+
+
 def case_frame(db: sqlite3.Connection, ulcid: str | None = None) -> pd.DataFrame:
-    query = """SELECT u.ulcid, u.match_method, u.confidence_score, l.*, r.stay_status,
+    query = """SELECT u.ulcid, u.match_method, u.confidence_score, l.*,
+                     s.current_stage AS snapshot_current_stage,
+                     s.days_in_current_stage AS snapshot_days_in_current_stage,
+                     r.stay_status,
                      p.sanctioned_amt, p.disbursed_amt, rr.families_resettled, rr.grievance_count,
                      d.owner_type, d.classification
               FROM ulcid_registry u JOIN la_cases l ON u.case_no=l.case_no
+              JOIN (
+                  SELECT current.case_no, current.current_stage, current.days_in_current_stage
+                  FROM case_snapshots current
+                  JOIN (
+                      SELECT case_no, MAX(snapshot_date) AS snapshot_date
+                      FROM case_snapshots
+                      GROUP BY case_no
+                  ) latest ON latest.case_no = current.case_no AND latest.snapshot_date = current.snapshot_date
+              ) s ON s.case_no = l.case_no
               JOIN rccms_cases r ON l.case_no=r.case_no_ref
               JOIN pfms_compensation p ON l.case_no=p.case_no_ref
               JOIN rr_records rr ON l.case_no=rr.case_no_ref
@@ -56,6 +88,8 @@ def case_frame(db: sqlite3.Connection, ulcid: str | None = None) -> pd.DataFrame
     data = pd.read_sql_query(query, db, params=params)
     if data.empty:
         return data
+    data["current_stage"] = data.pop("snapshot_current_stage")
+    data["days_in_current_stage"] = data.pop("snapshot_days_in_current_stage")
     data["compensation_ratio"] = data["disbursed_amt"] / data["sanctioned_amt"].clip(lower=1)
     data["rr_progress"] = data["families_resettled"] / data["affected_families"].clip(lower=1)
     return data
@@ -82,9 +116,11 @@ def dataset_rows(dataset_key: str) -> dict:
 
 def prediction(row: pd.Series) -> dict:
     bundle = model_bundle()
+    delay_bundle = delay_model_bundle()
     features = bundle["features"]
     values = row[features].to_frame().T
     probability = float(bundle["pipeline"].predict_proba(values)[0][1])
+    predicted_delay_days = float(delay_bundle["pipeline"].predict(values)[0])
     hard_flag = row["stay_status"] == "Stay Order"
     grievance_flag = int(row["grievance_count"]) >= 10
     risk_score = min(1.0, probability * 0.7 + hard_flag * 0.2 + grievance_flag * 0.1)
@@ -103,7 +139,7 @@ def prediction(row: pd.Series) -> dict:
     if not drivers:
         drivers.append({"feature": "Historical district performance", "impact": 0.04, "direction": "increases"})
     recommendation = "Legal cell review and stay-order escalation" if hard_flag else "Verify PFMS release queue" if row["compensation_ratio"] < 0.5 else "R&R officer intervention" if row["rr_progress"] < 0.5 else "Schedule next stage review"
-    return {"delay_probability": round(probability, 3), "risk_score": round(risk_score, 3), "risk_tier": tier, "drivers": drivers[:5], "recommendation": recommendation}
+    return {"delay_probability": round(probability, 3), "predicted_delay_days": round(predicted_delay_days, 1), "predicted_delay_months": round(predicted_delay_days / 30, 1), "risk_score": round(risk_score, 3), "risk_tier": tier, "drivers": drivers[:5], "recommendation": recommendation}
 
 
 @app.get("/health")
@@ -159,6 +195,32 @@ def get_case(ulcid: str) -> dict:
 def get_prediction(ulcid: str) -> dict:
     case = get_case(ulcid)
     return case["prediction"]
+
+
+@app.post("/cases/{ulcid}/what-if")
+def what_if(ulcid: str, overrides: WhatIfOverrides) -> dict:
+    with connection() as db:
+        data = case_frame(db, ulcid)
+    if data.empty:
+        raise HTTPException(status_code=404, detail="ULCID not found")
+    original_row = data.iloc[0]
+    modified_row = original_row.copy()
+    if overrides.legal_dispute_flag is not None:
+        modified_row["stay_status"] = "Stay Order" if overrides.legal_dispute_flag else "No Active Case"
+    if overrides.days_in_current_stage is not None:
+        modified_row["days_in_current_stage"] = overrides.days_in_current_stage
+    if overrides.compensation_paid_ratio is not None:
+        modified_row["compensation_ratio"] = overrides.compensation_paid_ratio
+    if overrides.rehabilitation_progress is not None:
+        modified_row["rr_progress"] = overrides.rehabilitation_progress
+    original = prediction(original_row)
+    modified = prediction(modified_row)
+    return {
+        "ulcid": ulcid,
+        "overrides": overrides.model_dump(exclude_none=True),
+        "original": {"chance_of_delay": original["delay_probability"], "predicted_delay_days": original["predicted_delay_days"], "predicted_delay_months": original["predicted_delay_months"]},
+        "modified": {"chance_of_delay": modified["delay_probability"], "predicted_delay_days": modified["predicted_delay_days"], "predicted_delay_months": modified["predicted_delay_months"]},
+    }
 
 
 @app.get("/alerts")

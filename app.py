@@ -5,7 +5,7 @@ import requests
 import streamlit as st
 
 
-API_URL = os.getenv("BHOOMIPREDICT_API", os.getenv("RISKXPLAIN_API", "http://localhost:8000"))
+API_URL = os.getenv("BHOOMIPREDICT_API", os.getenv("RISKXPLAIN_API", "http://127.0.0.1:8000"))
 st.set_page_config(page_title="BhooMiPredict", page_icon="BP", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown(
@@ -49,7 +49,13 @@ st.markdown(
 
 @st.cache_data(ttl=20)
 def get(path: str, params: dict | None = None):
-    response = requests.get(f"{API_URL}{path}", params=params, timeout=5)
+    response = requests.get(f"{API_URL}{path}", params=params, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
+def post(path: str, payload: dict):
+    response = requests.post(f"{API_URL}{path}", json=payload, timeout=20)
     response.raise_for_status()
     return response.json()
 
@@ -62,7 +68,7 @@ def detail_card(title: str, values: dict) -> None:
 try:
     overview = get("/overview")
 except requests.RequestException:
-    st.error("The case service is not available. Please start the application service and try again.")
+    st.error(f"The case service at {API_URL} could not be reached. Start FastAPI with: .\\env\\Scripts\\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000")
     st.stop()
 
 with st.sidebar:
@@ -126,6 +132,23 @@ elif page == "Case details":
     with next_col:
         st.markdown(f'<div class="insight"><strong>Suggested next step</strong><br>{prediction["recommendation"]}</div>', unsafe_allow_html=True)
         detail_card("Payments and rehabilitation", {"Compensation paid": f'{case["compensation"]["ratio"]:.0%}', "Families affected": case["acquisition"]["affected_families"], "Families resettled": case["rehabilitation"]["families_resettled"], "Open grievances": case["rehabilitation"]["grievances"]})
+    st.markdown('<div class="section-head"><div><div class="eyebrow">Try a different outcome</div><h2>What if?</h2></div></div>', unsafe_allow_html=True)
+    st.caption("Adjust the case conditions to see how the prediction could change.")
+    what_if_a, what_if_b, what_if_c, what_if_d = st.columns(4, gap="medium")
+    with what_if_a:
+        legal_resolved = st.toggle("Court issue resolved", value=case["legal"]["stay_status"] != "Stay Order", key=f"legal_{selected}")
+    with what_if_b:
+        stage_days = st.slider("Days in current step", 1, 365, int(case["acquisition"]["days_in_stage"]), key=f"days_{selected}")
+    with what_if_c:
+        paid_ratio = st.slider("Compensation paid", 0.0, 1.0, float(case["compensation"]["ratio"]), 0.05, format="%.0f%%", key=f"paid_{selected}")
+    with what_if_d:
+        rr_progress = st.slider("Rehabilitation progress", 0.0, 1.0, float(case["rehabilitation"]["progress"]), 0.05, format="%.0f%%", key=f"rr_{selected}")
+    what_if_result = post(f"/cases/{selected}/what-if", {"legal_dispute_flag": not legal_resolved, "days_in_current_stage": stage_days, "compensation_paid_ratio": paid_ratio, "rehabilitation_progress": rr_progress})
+    before, after = st.columns(2, gap="medium")
+    with before:
+        detail_card("Current prediction", {"Chance of delay": f'{what_if_result["original"]["chance_of_delay"]:.0%}', "Expected delay": f'{what_if_result["original"]["predicted_delay_days"]:.0f} days', "In months": f'{what_if_result["original"]["predicted_delay_months"]:.1f} months'})
+    with after:
+        detail_card("What-if prediction", {"Chance of delay": f'{what_if_result["modified"]["chance_of_delay"]:.0%}', "Expected delay": f'{what_if_result["modified"]["predicted_delay_days"]:.0f} days', "In months": f'{what_if_result["modified"]["predicted_delay_months"]:.1f} months'})
 
 elif page == "Data explorer":
     st.markdown('<div class="eyebrow">See the data behind the decision</div><h1>Data explorer</h1><p class="section-note">Compare each department\'s records with the joined case view used by BhooMiPredict.</p>', unsafe_allow_html=True)

@@ -13,10 +13,14 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "riskxplain.db"
+SIM_TODAY = date(2026, 9, 5)
+STAGES = ["Notification", "Survey", "Declaration", "Award", "Compensation", "Possession", "R&R"]
+BENCHMARK_DAYS = {"Notification": 45, "Survey": 60, "Declaration": 75, "Award": 60, "Compensation": 90, "Possession": 60, "R&R": 120}
 
 SCHEMA = """
 DROP TABLE IF EXISTS alerts;
 DROP TABLE IF EXISTS audit_log;
+DROP TABLE IF EXISTS case_snapshots;
 DROP TABLE IF EXISTS data_quality_exceptions;
 DROP TABLE IF EXISTS ulcid_registry;
 DROP TABLE IF EXISTS rr_records;
@@ -25,7 +29,8 @@ DROP TABLE IF EXISTS rccms_cases;
 DROP TABLE IF EXISTS la_cases;
 DROP TABLE IF EXISTS dilrmp_parcels;
 CREATE TABLE dilrmp_parcels (ulpin TEXT PRIMARY KEY, owner_type TEXT, classification TEXT, area_hectares REAL, ingested_at TEXT);
-CREATE TABLE la_cases (case_no TEXT PRIMARY KEY, ulpin TEXT, lgd_district TEXT, district_name TEXT, lgd_block TEXT, project_type TEXT, notification_date TEXT, current_stage TEXT, days_in_current_stage INTEGER, affected_families INTEGER, land_area_hectares REAL, historical_delay_days REAL, ingested_at TEXT);
+CREATE TABLE la_cases (case_no TEXT PRIMARY KEY, ulpin TEXT, lgd_district TEXT, district_name TEXT, lgd_block TEXT, project_type TEXT, notification_date TEXT, current_stage TEXT, days_in_current_stage INTEGER, affected_families INTEGER, land_area_hectares REAL, historical_delay_days REAL, completed BOOLEAN NOT NULL, actual_delay_days INTEGER NULL, ingested_at TEXT);
+CREATE TABLE case_snapshots (case_no TEXT, snapshot_date TEXT, current_stage TEXT, days_in_current_stage INTEGER, PRIMARY KEY (case_no, snapshot_date));
 CREATE TABLE rccms_cases (court_case_id TEXT PRIMARY KEY, case_no_ref TEXT, stay_status TEXT, filed_date TEXT, ingested_at TEXT);
 CREATE TABLE pfms_compensation (utr TEXT PRIMARY KEY, case_no_ref TEXT, sanctioned_amt REAL, disbursed_amt REAL, disbursed_date TEXT, ingested_at TEXT);
 CREATE TABLE rr_records (rr_id TEXT PRIMARY KEY, case_no_ref TEXT, families_total INTEGER, families_resettled INTEGER, grievance_count INTEGER, ingested_at TEXT);
@@ -43,37 +48,62 @@ def _ulcid(case_no: str) -> str:
 def build_seed_data() -> None:
     rng = np.random.default_rng(42)
     districts = [("WB-PB", "Paschim Burdwan", "Kanksa"), ("BR-GY", "Gaya", "Tekari"), ("AP-AN", "Anantapur", "Garladinne"), ("MH-NP", "Nagpur", "Hingna"), ("MP-IN", "Indore", "Depalpur")]
-    stages = ["Notification", "Survey", "Declaration", "Award", "Compensation", "Possession", "R&R"]
     project_types = ["Road", "Irrigation", "Rail", "Industrial Corridor"]
-    today = date.today()
-    cases, parcels, courts, payments, rr_rows, registry = [], [], [], [], [], []
+    cases, snapshots, parcels, courts, payments, rr_rows, registry = [], [], [], [], [], [], []
 
     for index in range(60):
         district_code, district_name, block_name = districts[index % len(districts)]
         case_no = f"LA-{district_code}-{2023 + index % 3}-{index + 1:04d}"
         ulpin = f"{index + 1:014d}"
-        stage = stages[index % len(stages)]
-        days = int(rng.integers(8, 125))
         affected = int(rng.integers(8, 180))
         area = round(float(rng.uniform(2, 85)), 2)
         stay = index % 9 == 0 or index % 13 == 0
         grievances = int(rng.integers(0, 12 if index % 4 else 28))
         sanctioned = round(float(rng.uniform(1800000, 28000000)), 2)
-        ratio = 0 if stage in {"Notification", "Survey"} else float(rng.uniform(0.18, 1.0))
+        ratio = float(rng.uniform(0.18, 1.0))
         disbursed = round(sanctioned * ratio, 2)
-        notification = today - timedelta(days=int(rng.integers(100, 1000)))
-        ingested = today.isoformat()
-        cases.append((case_no, ulpin, district_code, district_name, block_name, project_types[index % 4], notification.isoformat(), stage, days, affected, area, round(float(rng.uniform(20, 180)), 1), ingested))
+        benchmark_total = sum(BENCHMARK_DAYS.values())
+        stage_durations = {}
+        for stage in STAGES:
+            risk_multiplier = 1.0 + (0.75 if stay else 0.0) + (0.35 if grievances >= 10 else 0.0)
+            if stage in {"Compensation", "Possession"}:
+                risk_multiplier += (1.0 - ratio) * 0.9
+            stage_durations[stage] = max(7, int(round(BENCHMARK_DAYS[stage] * rng.uniform(0.75, 1.25) * risk_multiplier)))
+        actual_total = sum(stage_durations.values())
+        elapsed_days = int(rng.integers(350, 1050))
+        notification = SIM_TODAY - timedelta(days=elapsed_days)
+        completed = notification + timedelta(days=actual_total) <= SIM_TODAY
+        observed_days = actual_total if completed else elapsed_days
+        elapsed = 0
+        current_stage = STAGES[-1]
+        days_in_stage = stage_durations[current_stage]
+        for stage in STAGES:
+            stage_start = elapsed
+            stage_end = elapsed + stage_durations[stage]
+            observed_stage_days = max(0, min(observed_days, stage_end) - stage_start)
+            snapshot_count = max(1, (observed_stage_days + 29) // 30) if observed_stage_days else 0
+            for snapshot_index in range(snapshot_count):
+                snapshot_offset = min(snapshot_index * 30, observed_stage_days - 1)
+                snapshots.append((case_no, (notification + timedelta(days=stage_start + snapshot_offset)).isoformat(), stage, snapshot_offset + 1))
+            if observed_days <= stage_end:
+                current_stage = stage
+                days_in_stage = max(1, observed_days - stage_start)
+                break
+            elapsed = stage_end
+        actual_delay_days = actual_total - benchmark_total if completed else None
+        ingested = SIM_TODAY.isoformat()
+        cases.append((case_no, ulpin, district_code, district_name, block_name, project_types[index % 4], notification.isoformat(), current_stage, days_in_stage, affected, area, round(float(rng.uniform(20, 180)), 1), int(completed), actual_delay_days, ingested))
         parcels.append((ulpin, "Individual" if index % 3 else "Government", "Agricultural" if index % 4 else "Residential", area, ingested))
         courts.append((f"RCC-{index + 1:05d}", case_no, "Stay Order" if stay else "No Active Case", (notification + timedelta(days=40)).isoformat(), ingested))
-        payments.append((f"UTR-{index + 1:08d}", case_no, sanctioned, disbursed, (today - timedelta(days=int(rng.integers(1, 200)))).isoformat() if disbursed else None, ingested))
+        payments.append((f"UTR-{index + 1:08d}", case_no, sanctioned, disbursed, (SIM_TODAY - timedelta(days=int(rng.integers(1, 200)))).isoformat() if disbursed else None, ingested))
         rr_rows.append((f"RR-{index + 1:05d}", case_no, affected, int(affected * rng.uniform(0.05, 0.95)), grievances, ingested))
-        registry.append((_ulcid(case_no), case_no, ulpin, f"RCC-{index + 1:05d}", f"UTR-{index + 1:08d}", f"RR-{index + 1:05d}", "fuzzy" if index in {7, 22, 41} else "deterministic", 0.86 if index in {7, 22, 41} else 1.0, today.isoformat()))
+        registry.append((_ulcid(case_no), case_no, ulpin, f"RCC-{index + 1:05d}", f"UTR-{index + 1:08d}", f"RR-{index + 1:05d}", "fuzzy" if index in {7, 22, 41} else "deterministic", 0.86 if index in {7, 22, 41} else 1.0, ingested))
 
     with sqlite3.connect(DB_PATH) as connection:
         connection.executescript(SCHEMA)
         tables = {
-            "la_cases": (cases, ["case_no", "ulpin", "lgd_district", "district_name", "lgd_block", "project_type", "notification_date", "current_stage", "days_in_current_stage", "affected_families", "land_area_hectares", "historical_delay_days", "ingested_at"]),
+            "la_cases": (cases, ["case_no", "ulpin", "lgd_district", "district_name", "lgd_block", "project_type", "notification_date", "current_stage", "days_in_current_stage", "affected_families", "land_area_hectares", "historical_delay_days", "completed", "actual_delay_days", "ingested_at"]),
+            "case_snapshots": (snapshots, ["case_no", "snapshot_date", "current_stage", "days_in_current_stage"]),
             "dilrmp_parcels": (parcels, ["ulpin", "owner_type", "classification", "area_hectares", "ingested_at"]),
             "rccms_cases": (courts, ["court_case_id", "case_no_ref", "stay_status", "filed_date", "ingested_at"]),
             "pfms_compensation": (payments, ["utr", "case_no_ref", "sanctioned_amt", "disbursed_amt", "disbursed_date", "ingested_at"]),
@@ -84,11 +114,11 @@ def build_seed_data() -> None:
             pd.DataFrame(rows, columns=columns).to_sql(table, connection, if_exists="append", index=False)
         exceptions = [(1, "ulcid_registry", registry[7][0], "FUZZY_MATCH_REVIEW", "warning", 0), (2, "la_cases", "LA-BR-GY-2024-0023", "MISSING_BLOCK_CODE", "warning", 0), (3, "pfms_compensation", "UTR-00000041", "DISBURSEMENT_MISMATCH", "error", 0)]
         pd.DataFrame(exceptions, columns=["id", "source_table", "record_key", "reason_code", "severity", "resolved"]).to_sql("data_quality_exceptions", connection, if_exists="append", index=False)
-        alert_rows = [(idx + 1, row[0], "HIGH_RISK", "High delay probability requires officer review", "unread", today.isoformat()) for idx, row in enumerate(registry[:8])]
+        alert_rows = [(idx + 1, row[0], "HIGH_RISK", "High delay probability requires officer review", "unread", SIM_TODAY.isoformat()) for idx, row in enumerate(registry[:8])]
         pd.DataFrame(alert_rows, columns=["id", "ulcid", "alert_type", "message", "status", "created_at"]).to_sql("alerts", connection, if_exists="append", index=False)
-        audit_rows = [(idx + 1, "seed-script", "INGEST", row[0], today.isoformat()) for idx, row in enumerate(registry[:10])]
+        audit_rows = [(idx + 1, "seed-script", "INGEST", row[0], SIM_TODAY.isoformat()) for idx, row in enumerate(registry[:10])]
         pd.DataFrame(audit_rows, columns=["id", "actor", "action", "ulcid", "created_at"]).to_sql("audit_log", connection, if_exists="append", index=False)
-    print(f"Seeded {len(cases)} cases into {DB_PATH}")
+    print(f"Seeded {len(cases)} cases and {len(snapshots)} snapshots into {DB_PATH}")
 
 
 if __name__ == "__main__":

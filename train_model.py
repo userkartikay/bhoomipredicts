@@ -6,13 +6,16 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 from sklearn.compose import ColumnTransformer
+from sklearn.metrics import mean_absolute_error
 from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from seed_data import DB_PATH, build_seed_data
 
 ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "risk_model.pkl"
+DELAY_MODEL_PATH = ROOT / "delay_days_model.pkl"
 FEATURES = ["project_type", "current_stage", "days_in_current_stage", "affected_families", "land_area_hectares", "historical_delay_days", "stay_status", "compensation_ratio", "rr_progress", "grievance_count"]
 
 
@@ -33,18 +36,35 @@ def train() -> None:
     data = load_training_data()
     categorical = ["project_type", "current_stage", "stay_status"]
     numerical = [feature for feature in FEATURES if feature not in categorical]
-    preprocessor = ColumnTransformer(transformers=[
-        ("num", StandardScaler(), numerical),
-        ("cat", OneHotEncoder(handle_unknown="ignore"), categorical)
-    ])
+    def preprocessor() -> ColumnTransformer:
+        return ColumnTransformer(transformers=[
+            ("num", StandardScaler(), numerical),
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categorical)
+        ])
+
     model_pipeline = Pipeline([
-        ("preprocessor", preprocessor),
+        ("preprocessor", preprocessor()),
         ("classifier", xgb.XGBClassifier(n_estimators=120, max_depth=3, learning_rate=0.08, random_state=42, eval_metric="logloss"))
     ])
 
     model_pipeline.fit(data[FEATURES], data["delayed"])
     joblib.dump({"pipeline": model_pipeline, "features": FEATURES, "training_rows": len(data)}, MODEL_PATH)
     print(f"Trained stage-aware XGBoost classifier on {len(data)} cases -> {MODEL_PATH}")
+
+    completed = data[data["completed"] == 1].copy()
+    train_features, test_features, train_target, test_target = train_test_split(
+        completed[FEATURES], completed["actual_delay_days"], test_size=0.25, random_state=42
+    )
+    delay_pipeline = Pipeline([
+        ("preprocessor", preprocessor()),
+        ("regressor", xgb.XGBRegressor(n_estimators=120, max_depth=3, learning_rate=0.08, random_state=42, objective="reg:squarederror"))
+    ])
+    delay_pipeline.fit(train_features, train_target)
+    delay_prediction = delay_pipeline.predict(test_features)
+    delay_mae = float(mean_absolute_error(test_target, delay_prediction))
+    joblib.dump({"pipeline": delay_pipeline, "features": FEATURES, "training_rows": len(completed), "test_mae_days": delay_mae}, DELAY_MODEL_PATH)
+    print(f"Trained delay-days regressor on {len(completed)} completed cases -> {DELAY_MODEL_PATH}")
+    print(f"Held-out delay MAE: {delay_mae:.2f} days")
 
 
 if __name__ == "__main__":
